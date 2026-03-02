@@ -97,7 +97,7 @@ Particle positions are stored as `vec4(x, y, z, inverse_mass)` where `inverse_ma
 
 ## Demo
 
-Open `demo/cloth_demo.tscn` for a working example: a 12x24 cape-sized cloth with top-row pinning and a sphere collider.
+Open `demo/cloth_demo.tscn` for a working example: a cape-sized cloth with top-row pinning and a sphere collider, along with a pinned cloth example.
 
 The `cloth_demo_driver.gd` script (not attached by default) oscillates pins and the collider for stress testing.
 
