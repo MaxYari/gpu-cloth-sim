@@ -1,0 +1,762 @@
+@tool
+class_name GPUClothSolver
+extends Node3D
+
+@export_group("Cloth Dimensions")
+@export var cloth_width: int = 20
+@export var cloth_height: int = 20
+@export var particle_spacing: float = 0.1
+
+@export_group("Physics")
+@export var gravity_strength: float = -9.8
+@export var solver_iterations: int = 8
+@export var substeps: int = 8
+@export var stiffness: float = 0.5
+@export var bend_stiffness: float = 0.1
+@export var damping: float = 0.99
+@export var max_speed: float = 5.0
+
+@export_group("Pinning")
+@export var pin_targets: Array[NodePath] = []
+@export var pin_top_row: bool = false
+
+@export_group("Appearance")
+@export var cloth_material: Material
+
+@export_group("Inertia")
+@export var inertia_scale: Vector3 = Vector3(1.0, 1.0, 1.0)
+
+@export_group("Wind")
+@export var wind: Vector3 = Vector3.ZERO
+@export var wind_turbulence: float = 0.3
+@export var wind_frequency: float = 1.0
+
+# GPU resources
+var _rd: RenderingDevice
+
+var _positions_buffer: RID
+var _predicted_buffer: RID
+var _velocities_buffer: RID
+var _constraints_buffer: RID
+
+var _predict_shader: RID
+var _solve_shader: RID
+var _update_shader: RID
+
+var _predict_pipeline: RID
+var _solve_pipeline: RID
+var _update_pipeline: RID
+
+var _predict_uniform_set: RID
+var _solve_uniform_set: RID
+var _update_uniform_set: RID
+
+var _particle_count: int
+var _constraint_count: int
+var _constraint_groups: Array = []
+
+# Collision
+var _colliders_buffer: RID
+var _collide_shader: RID
+var _collide_pipeline: RID
+var _collide_uniform_set: RID
+var _colliders: Array[GPUClothCollider] = []
+var _collider_count: int = 0
+
+# Pinning
+var _pin_map: Array[Dictionary] = []
+
+# Inertia tracking
+var _prev_global_pos: Vector3
+
+# Mesh
+var _mesh_instance: MeshInstance3D
+var _mesh: ArrayMesh
+var _uvs: PackedVector2Array
+var _indices: PackedInt32Array
+
+# Editor preview
+var _editor_im: ImmediateMesh
+var _editor_mi: MeshInstance3D
+
+# Plugin-relative path resolution
+var _plugin_dir: String
+
+
+func _ready() -> void:
+	_plugin_dir = get_script().resource_path.get_base_dir().get_base_dir()
+
+	if Engine.is_editor_hint():
+		_setup_editor_preview()
+		set_process(true)
+		return
+	set_process(false)
+
+	if not RenderingServer.get_rendering_device():
+		push_error("GPUClothSolver requires Vulkan renderer (Forward+ or Mobile)")
+		return
+
+	_particle_count = cloth_width * cloth_height
+
+	# Discover collider children
+	for child in get_children():
+		if child is GPUClothCollider:
+			_colliders.append(child)
+	_collider_count = _colliders.size()
+
+	# Build CPU-side data
+	var pos_data: PackedFloat32Array = _build_positions()
+	var vel_data: PackedFloat32Array = _build_velocities()
+	var con_data: PackedFloat32Array = _build_constraints()
+	_constraint_count = con_data.size() / 4
+
+	# Resolve pin targets — find nearest particle per marker
+	for path in pin_targets:
+		var marker: Node3D = get_node_or_null(path)
+		if marker == null:
+			push_warning("GPUClothSolver: pin target '%s' not found" % path)
+			continue
+		var local_pos: Vector3 = to_local(marker.global_position)
+		var best_idx: int = 0
+		var best_d: float = INF
+		for i in _particle_count:
+			var off: int = i * 4
+			var d: float = local_pos.distance_squared_to(
+				Vector3(pos_data[off], pos_data[off + 1], pos_data[off + 2]))
+			if d < best_d:
+				best_d = d
+				best_idx = i
+		pos_data[best_idx * 4 + 3] = 0.0
+		_pin_map.append({marker = marker, particle_idx = best_idx})
+
+	# Build static mesh arrays
+	_build_mesh_topology()
+
+	# GPU setup
+	_rd = RenderingServer.create_local_rendering_device()
+
+	var pos_bytes: PackedByteArray = pos_data.to_byte_array()
+	var vel_bytes: PackedByteArray = vel_data.to_byte_array()
+	var con_bytes: PackedByteArray = con_data.to_byte_array()
+
+	_positions_buffer = _rd.storage_buffer_create(pos_bytes.size(), pos_bytes)
+	_predicted_buffer = _rd.storage_buffer_create(pos_bytes.size(), pos_bytes)
+	_velocities_buffer = _rd.storage_buffer_create(vel_bytes.size(), vel_bytes)
+	_constraints_buffer = _rd.storage_buffer_create(con_bytes.size(), con_bytes)
+
+	var collider_bytes: PackedByteArray = _pack_colliders()
+	_colliders_buffer = _rd.storage_buffer_create(max(collider_bytes.size(), 64), collider_bytes)
+
+	# Shaders
+	_predict_shader = _load_shader(_plugin_dir + "/shaders/compute/cloth_predict.glsl")
+	_solve_shader = _load_shader(_plugin_dir + "/shaders/compute/cloth_solve.glsl")
+	_update_shader = _load_shader(_plugin_dir + "/shaders/compute/cloth_update.glsl")
+	_collide_shader = _load_shader(_plugin_dir + "/shaders/compute/cloth_collide.glsl")
+
+	# Pipelines
+	_predict_pipeline = _rd.compute_pipeline_create(_predict_shader)
+	_solve_pipeline = _rd.compute_pipeline_create(_solve_shader)
+	_update_pipeline = _rd.compute_pipeline_create(_update_shader)
+	_collide_pipeline = _rd.compute_pipeline_create(_collide_shader)
+
+	# Uniform sets
+	_predict_uniform_set = _create_uniform_set(_predict_shader, [
+		_make_uniform(0, _positions_buffer),
+		_make_uniform(1, _predicted_buffer),
+		_make_uniform(2, _velocities_buffer),
+	])
+	_solve_uniform_set = _create_uniform_set(_solve_shader, [
+		_make_uniform(1, _predicted_buffer),
+		_make_uniform(3, _constraints_buffer),
+	])
+	_update_uniform_set = _create_uniform_set(_update_shader, [
+		_make_uniform(0, _positions_buffer),
+		_make_uniform(1, _predicted_buffer),
+		_make_uniform(2, _velocities_buffer),
+	])
+	_collide_uniform_set = _create_uniform_set(_collide_shader, [
+		_make_uniform(1, _predicted_buffer),
+		_make_uniform(4, _colliders_buffer),
+	])
+
+	# Mesh instance
+	_mesh = ArrayMesh.new()
+	_mesh_instance = MeshInstance3D.new()
+	_mesh_instance.mesh = _mesh
+	if cloth_material:
+		_mesh_instance.material_override = cloth_material
+	else:
+		var shader: Shader = load(_plugin_dir + "/shaders/cloth_surface.gdshader")
+		var mat := ShaderMaterial.new()
+		mat.shader = shader
+		_mesh_instance.material_override = mat
+	add_child(_mesh_instance)
+
+	# Build initial mesh from starting positions
+	_update_mesh(pos_data.to_byte_array())
+
+	_prev_global_pos = global_position
+
+
+func _physics_process(delta: float) -> void:
+	if Engine.is_editor_hint():
+		return
+	var sub_dt: float = delta / float(substeps)
+
+	# Update pin positions from markers
+	for pin in _pin_map:
+		if not is_instance_valid(pin.marker):
+			continue
+		var p: Vector3 = to_local(pin.marker.global_position)
+		var pin_bytes := PackedByteArray()
+		pin_bytes.resize(16)
+		pin_bytes.encode_float(0, p.x)
+		pin_bytes.encode_float(4, p.y)
+		pin_bytes.encode_float(8, p.z)
+		pin_bytes.encode_float(12, 0.0)
+		_rd.buffer_update(_positions_buffer, pin.particle_idx * 16, 16, pin_bytes)
+
+	# Upload collider transforms
+	if _collider_count > 0:
+		var cb: PackedByteArray = _pack_colliders()
+		_rd.buffer_update(_colliders_buffer, 0, cb.size(), cb)
+
+	# Compute inertia offset — compensate for parent movement in local space
+	var delta_world: Vector3 = global_position - _prev_global_pos
+	var delta_local: Vector3 = global_transform.basis.inverse() * delta_world
+	var inertia_per_sub: Vector3 = delta_local * inertia_scale / float(substeps)
+	_prev_global_pos = global_position
+
+	# Wind with turbulence — sum of sines at irrational ratios for organic gusts
+	var t: float = Time.get_ticks_msec() / 1000.0 * wind_frequency
+	var gust: Vector3 = Vector3(
+		sin(t * 1.7) + sin(t * 3.1 + 1.3),
+		sin(t * 1.3 + 2.0) + sin(t * 2.7 + 0.7),
+		sin(t * 2.1 + 4.0) + sin(t * 1.9 + 3.1)
+	) * 0.5
+	var effective_wind: Vector3 = wind + wind.length() * gust * wind_turbulence
+	var local_wind: Vector3 = global_transform.basis.inverse() * effective_wind
+
+	var push_data := PackedByteArray()
+	push_data.resize(64)
+	push_data.encode_float(0, sub_dt)
+	push_data.encode_float(4, gravity_strength)
+	push_data.encode_u32(8, _particle_count)
+	push_data.encode_u32(12, _constraint_count)
+	push_data.encode_float(16, damping)
+	push_data.encode_float(20, max_speed)
+	push_data.encode_u32(24, _collider_count)
+	# 28-31: padding
+	push_data.encode_float(32, inertia_per_sub.x)
+	push_data.encode_float(36, inertia_per_sub.y)
+	push_data.encode_float(40, inertia_per_sub.z)
+	# 44-47: padding
+	push_data.encode_float(48, local_wind.x)
+	push_data.encode_float(52, local_wind.y)
+	push_data.encode_float(56, local_wind.z)
+	# 60-63: padding
+
+	var particle_groups: int = ceili(float(_particle_count) / 64.0)
+
+	var cl: int = _rd.compute_list_begin()
+
+	for _s in substeps:
+		# Predict
+		_rd.compute_list_bind_compute_pipeline(cl, _predict_pipeline)
+		_rd.compute_list_bind_uniform_set(cl, _predict_uniform_set, 0)
+		_rd.compute_list_set_push_constant(cl, push_data, push_data.size())
+		_rd.compute_list_dispatch(cl, particle_groups, 1, 1)
+		_rd.compute_list_add_barrier(cl)
+
+		# Constraint solve (graph-colored groups)
+		_rd.compute_list_bind_compute_pipeline(cl, _solve_pipeline)
+		_rd.compute_list_bind_uniform_set(cl, _solve_uniform_set, 0)
+		for _i in solver_iterations:
+			for group in _constraint_groups:
+				push_data.encode_u32(12, group.count)
+				push_data.encode_u32(28, group.offset)
+				_rd.compute_list_set_push_constant(cl, push_data, push_data.size())
+				_rd.compute_list_dispatch(cl, ceili(float(group.count) / 64.0), 1, 1)
+				_rd.compute_list_add_barrier(cl)
+
+		# Collide
+		if _collider_count > 0:
+			_rd.compute_list_bind_compute_pipeline(cl, _collide_pipeline)
+			_rd.compute_list_bind_uniform_set(cl, _collide_uniform_set, 0)
+			_rd.compute_list_set_push_constant(cl, push_data, push_data.size())
+			_rd.compute_list_dispatch(cl, particle_groups, 1, 1)
+			_rd.compute_list_add_barrier(cl)
+
+		# Update
+		_rd.compute_list_bind_compute_pipeline(cl, _update_pipeline)
+		_rd.compute_list_bind_uniform_set(cl, _update_uniform_set, 0)
+		_rd.compute_list_set_push_constant(cl, push_data, push_data.size())
+		_rd.compute_list_dispatch(cl, particle_groups, 1, 1)
+		_rd.compute_list_add_barrier(cl)
+
+	_rd.compute_list_end()
+	_rd.submit()
+	_rd.sync()
+
+	var output_bytes: PackedByteArray = _rd.buffer_get_data(_positions_buffer)
+	_update_mesh(output_bytes)
+
+
+# ── Data builders ──────────────────────────────────────────────
+
+func _build_positions() -> PackedFloat32Array:
+	var data := PackedFloat32Array()
+	data.resize(_particle_count * 4)
+	var half_w: float = (cloth_width - 1) * particle_spacing * 0.5
+	for row in cloth_height:
+		for col in cloth_width:
+			var idx: int = (row * cloth_width + col) * 4
+			data[idx] = col * particle_spacing - half_w  # X: centered
+			data[idx + 1] = -row * particle_spacing       # Y: hang downward
+			data[idx + 2] = 0.0                            # Z: flat
+			data[idx + 3] = 1.0                            # w = inverse mass (pins applied after)
+	if pin_top_row:
+		for col in cloth_width:
+			data[col * 4 + 3] = 0.0
+	return data
+
+
+func _build_velocities() -> PackedFloat32Array:
+	var data := PackedFloat32Array()
+	data.resize(_particle_count * 4)
+	data.fill(0.0)
+	return data
+
+
+func _build_constraints() -> PackedFloat32Array:
+	# Graph-colored: 8 groups, no two constraints in a group share a particle.
+	# Dispatched separately with barriers to eliminate race conditions.
+	var data := PackedFloat32Array()
+	var w: int = cloth_width
+	var h: int = cloth_height
+	var s: float = particle_spacing
+	var diag: float = s * sqrt(2.0)
+	_constraint_groups = []
+
+	# Horizontal — even columns
+	var start: int = data.size() / 4
+	for row in h:
+		for col in range(0, w - 1, 2):
+			var a: int = row * w + col
+			_push_constraint(data, a, a + 1, s, stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Horizontal — odd columns
+	start = data.size() / 4
+	for row in h:
+		for col in range(1, w - 1, 2):
+			var a: int = row * w + col
+			_push_constraint(data, a, a + 1, s, stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Vertical — even rows
+	start = data.size() / 4
+	for row in range(0, h - 1, 2):
+		for col in w:
+			var a: int = row * w + col
+			_push_constraint(data, a, a + w, s, stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Vertical — odd rows
+	start = data.size() / 4
+	for row in range(1, h - 1, 2):
+		for col in w:
+			var a: int = row * w + col
+			_push_constraint(data, a, a + w, s, stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Diagonal '\' — even rows
+	start = data.size() / 4
+	for row in range(0, h - 1, 2):
+		for col in w - 1:
+			var a: int = row * w + col
+			_push_constraint(data, a, a + w + 1, diag, stiffness * 0.5)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Diagonal '\' — odd rows
+	start = data.size() / 4
+	for row in range(1, h - 1, 2):
+		for col in w - 1:
+			var a: int = row * w + col
+			_push_constraint(data, a, a + w + 1, diag, stiffness * 0.5)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Diagonal '/' — even rows
+	start = data.size() / 4
+	for row in range(0, h - 1, 2):
+		for col in w - 1:
+			var a: int = row * w + col + 1
+			_push_constraint(data, a, a + w - 1, diag, stiffness * 0.5)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Diagonal '/' — odd rows
+	start = data.size() / 4
+	for row in range(1, h - 1, 2):
+		for col in w - 1:
+			var a: int = row * w + col + 1
+			_push_constraint(data, a, a + w - 1, diag, stiffness * 0.5)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# ── Bending constraints (skip-one) ──
+	var bend_rest: float = s * 2.0
+
+	# Horizontal bending — group 1: col % 4 in {0, 1}
+	start = data.size() / 4
+	for row in h:
+		for col in w - 2:
+			if col % 4 < 2:
+				var a: int = row * w + col
+				_push_constraint(data, a, a + 2, bend_rest, bend_stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Horizontal bending — group 2: col % 4 in {2, 3}
+	start = data.size() / 4
+	for row in h:
+		for col in w - 2:
+			if col % 4 >= 2:
+				var a: int = row * w + col
+				_push_constraint(data, a, a + 2, bend_rest, bend_stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Vertical bending — group 1: row % 4 in {0, 1}
+	start = data.size() / 4
+	for row in h - 2:
+		if row % 4 < 2:
+			for col in w:
+				var a: int = row * w + col
+				_push_constraint(data, a, a + w * 2, bend_rest, bend_stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	# Vertical bending — group 2: row % 4 in {2, 3}
+	start = data.size() / 4
+	for row in h - 2:
+		if row % 4 >= 2:
+			for col in w:
+				var a: int = row * w + col
+				_push_constraint(data, a, a + w * 2, bend_rest, bend_stiffness)
+	_constraint_groups.append({offset = start, count = data.size() / 4 - start})
+
+	return data
+
+
+func _push_constraint(data: PackedFloat32Array, a: int, b: int, rest: float, k: float) -> void:
+	data.append(float(a))
+	data.append(float(b))
+	data.append(rest)
+	data.append(k)
+
+
+# ── Mesh ───────────────────────────────────────────────────────
+
+func _build_mesh_topology() -> void:
+	_uvs = PackedVector2Array()
+	_uvs.resize(_particle_count)
+	for row in cloth_height:
+		for col in cloth_width:
+			var idx: int = row * cloth_width + col
+			_uvs[idx] = Vector2(
+				float(col) / float(cloth_width - 1),
+				float(row) / float(cloth_height - 1)
+			)
+
+	_indices = PackedInt32Array()
+	for row in cloth_height - 1:
+		for col in cloth_width - 1:
+			var i: int = row * cloth_width + col
+			# Triangle 1
+			_indices.append(i)
+			_indices.append(i + cloth_width)
+			_indices.append(i + 1)
+			# Triangle 2
+			_indices.append(i + 1)
+			_indices.append(i + cloth_width)
+			_indices.append(i + cloth_width + 1)
+
+
+func _update_mesh(data: PackedByteArray) -> void:
+	var verts := PackedVector3Array()
+	verts.resize(_particle_count)
+	for i in _particle_count:
+		var off: int = i * 16
+		verts[i] = Vector3(
+			data.decode_float(off),
+			data.decode_float(off + 4),
+			data.decode_float(off + 8)
+		)
+
+	# Compute normals from face cross products
+	var normals := PackedVector3Array()
+	normals.resize(_particle_count)
+	for i in _particle_count:
+		normals[i] = Vector3.ZERO
+
+	for row in cloth_height - 1:
+		for col in cloth_width - 1:
+			var i: int = row * cloth_width + col
+			var v0: Vector3 = verts[i]
+			var e1: Vector3 = verts[i + 1] - v0
+			var e2: Vector3 = verts[i + cloth_width] - v0
+			var n: Vector3 = e2.cross(e1)
+			normals[i] += n
+			normals[i + 1] += n
+			normals[i + cloth_width] += n
+			normals[i + cloth_width + 1] += n
+
+	for i in _particle_count:
+		if normals[i].length_squared() > 0.0001:
+			normals[i] = normals[i].normalized()
+		else:
+			normals[i] = Vector3.UP
+
+	# Compute tangents along U direction (column-to-column)
+	# Sign is -1.0 because V increases downward (row direction = -Y)
+	var tangents := PackedFloat32Array()
+	tangents.resize(_particle_count * 4)
+	for row in cloth_height:
+		for col in cloth_width:
+			var idx: int = row * cloth_width + col
+			var tan: Vector3
+			if col < cloth_width - 1:
+				tan = verts[idx + 1] - verts[idx]
+			else:
+				tan = verts[idx] - verts[idx - 1]
+			if tan.length_squared() < 1e-10:
+				tan = Vector3.RIGHT
+			else:
+				tan = tan.normalized()
+			var off: int = idx * 4
+			tangents[off] = tan.x
+			tangents[off + 1] = tan.y
+			tangents[off + 2] = tan.z
+			tangents[off + 3] = -1.0
+
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_TEX_UV] = _uvs
+	arrays[Mesh.ARRAY_TANGENT] = tangents
+	arrays[Mesh.ARRAY_INDEX] = _indices
+
+	_mesh.clear_surfaces()
+	_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+
+
+# ── Colliders ──────────────────────────────────────────────────
+
+func _pack_colliders() -> PackedByteArray:
+	var data := PackedByteArray()
+	if _colliders.is_empty():
+		data.resize(64)
+		return data
+	data.resize(_colliders.size() * 64)
+	var cloth_inv: Transform3D = global_transform.affine_inverse()
+	for i in _colliders.size():
+		var floats: PackedFloat32Array = _colliders[i].pack_collider_data(cloth_inv)
+		var off: int = i * 64
+		for j in 16:
+			data.encode_float(off + j * 4, floats[j])
+	return data
+
+
+# ── GPU helpers ────────────────────────────────────────────────
+
+func _load_shader(path: String) -> RID:
+	var shader_file: RDShaderFile = load(path)
+	var spirv: RDShaderSPIRV = shader_file.get_spirv()
+	return _rd.shader_create_from_spirv(spirv)
+
+
+func _make_uniform(binding: int, buffer: RID) -> RDUniform:
+	var u := RDUniform.new()
+	u.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u.binding = binding
+	u.add_id(buffer)
+	return u
+
+
+func _create_uniform_set(shader: RID, uniforms: Array[RDUniform]) -> RID:
+	return _rd.uniform_set_create(uniforms, shader, 0)
+
+
+# ── Editor preview ─────────────────────────────────────────────
+
+func _process(_delta: float) -> void:
+	if not Engine.is_editor_hint():
+		return
+	_redraw_editor_preview()
+
+
+func _setup_editor_preview() -> void:
+	_editor_im = ImmediateMesh.new()
+	_editor_mi = MeshInstance3D.new()
+	_editor_mi.mesh = _editor_im
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.set_flag(BaseMaterial3D.FLAG_DISABLE_DEPTH_TEST, true)
+	mat.vertex_color_use_as_albedo = true
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_editor_mi.material_override = mat
+	add_child(_editor_mi, false, Node.INTERNAL_MODE_FRONT)
+
+
+func _redraw_editor_preview() -> void:
+	if _editor_im == null:
+		return
+	_editor_im.clear_surfaces()
+
+	var w: int = cloth_width
+	var h: int = cloth_height
+	var s: float = particle_spacing
+	var half_w: float = (w - 1) * s * 0.5
+
+	# Precompute grid positions
+	var grid := PackedVector3Array()
+	grid.resize(w * h)
+	for row in h:
+		for col in w:
+			grid[row * w + col] = Vector3(col * s - half_w, -row * s, 0.0)
+
+	_editor_im.surface_begin(Mesh.PRIMITIVE_LINES)
+
+	# Grid wireframe
+	var grid_color := Color(0.5, 0.85, 1.0, 0.4)
+	# Horizontal lines
+	for row in h:
+		for col in w - 1:
+			_editor_im.surface_set_color(grid_color)
+			_editor_im.surface_add_vertex(grid[row * w + col])
+			_editor_im.surface_set_color(grid_color)
+			_editor_im.surface_add_vertex(grid[row * w + col + 1])
+	# Vertical lines
+	for col in w:
+		for row in h - 1:
+			_editor_im.surface_set_color(grid_color)
+			_editor_im.surface_add_vertex(grid[row * w + col])
+			_editor_im.surface_set_color(grid_color)
+			_editor_im.surface_add_vertex(grid[(row + 1) * w + col])
+
+	# Pin markers
+	var pin_color := Color(1.0, 0.9, 0.2, 0.9)
+	for path in pin_targets:
+		var marker: Node3D = get_node_or_null(path)
+		if marker == null:
+			continue
+		var local_pos: Vector3 = to_local(marker.global_position)
+		# Find nearest grid vertex
+		var best_idx: int = 0
+		var best_d: float = INF
+		for i in grid.size():
+			var d: float = local_pos.distance_squared_to(grid[i])
+			if d < best_d:
+				best_d = d
+				best_idx = i
+		_editor_im.surface_set_color(pin_color)
+		_editor_im.surface_add_vertex(local_pos)
+		_editor_im.surface_set_color(pin_color)
+		_editor_im.surface_add_vertex(grid[best_idx])
+
+	# Collider shapes
+	var col_color := Color(1.0, 0.35, 0.2, 0.8)
+	for child in get_children():
+		if not child is GPUClothCollider:
+			continue
+		var collider: GPUClothCollider = child
+		var center: Vector3 = to_local(collider.global_position)
+		var r: float = collider.radius
+
+		if collider.shape == GPUClothCollider.Shape.SPHERE:
+			_draw_circle(center, Vector3.UP, r, col_color)
+			_draw_circle(center, Vector3.RIGHT, r, col_color)
+			_draw_circle(center, Vector3.FORWARD, r, col_color)
+		elif collider.shape == GPUClothCollider.Shape.BOX:
+			# Box wireframe — 8 corners, 12 edges
+			var cloth_inv: Basis = global_transform.affine_inverse().basis
+			var col_basis: Basis = cloth_inv * collider.global_transform.basis
+			var r_axis: Vector3 = col_basis * Vector3.RIGHT
+			r_axis = r_axis.normalized() * collider.extents.x
+			var u_axis: Vector3 = col_basis * Vector3.UP
+			u_axis = u_axis.normalized() * collider.extents.y
+			var f_axis: Vector3 = col_basis * Vector3.FORWARD
+			f_axis = f_axis.normalized() * collider.extents.z
+			var corners: Array[Vector3] = []
+			for sx in [-1.0, 1.0]:
+				for sy in [-1.0, 1.0]:
+					for sz in [-1.0, 1.0]:
+						corners.append(center + r_axis * sx + u_axis * sy + f_axis * sz)
+			var edges: Array = [
+				[0,1],[2,3],[4,5],[6,7],
+				[0,2],[1,3],[4,6],[5,7],
+				[0,4],[1,5],[2,6],[3,7],
+			]
+			for e in edges:
+				_editor_im.surface_set_color(col_color)
+				_editor_im.surface_add_vertex(corners[e[0]])
+				_editor_im.surface_set_color(col_color)
+				_editor_im.surface_add_vertex(corners[e[1]])
+		else:
+			# Capsule
+			var half_inner: float = max((collider.height * 0.5) - r, 0.0)
+			var cloth_basis_inv: Basis = global_transform.affine_inverse().basis
+			var up: Vector3 = (cloth_basis_inv * collider.global_transform.basis * Vector3.UP).normalized()
+			var top: Vector3 = center + up * half_inner
+			var bot: Vector3 = center - up * half_inner
+			# End circles
+			_draw_circle(top, up, r, col_color)
+			_draw_circle(bot, up, r, col_color)
+			# Connecting lines
+			var perp1: Vector3
+			if abs(up.dot(Vector3.RIGHT)) < 0.9:
+				perp1 = up.cross(Vector3.RIGHT).normalized()
+			else:
+				perp1 = up.cross(Vector3.FORWARD).normalized()
+			var perp2: Vector3 = up.cross(perp1).normalized()
+			for p in [perp1, -perp1, perp2, -perp2]:
+				_editor_im.surface_set_color(col_color)
+				_editor_im.surface_add_vertex(top + p * r)
+				_editor_im.surface_set_color(col_color)
+				_editor_im.surface_add_vertex(bot + p * r)
+
+	_editor_im.surface_end()
+
+
+func _draw_circle(center: Vector3, axis: Vector3, radius: float, color: Color, segments: int = 32) -> void:
+	var perp1: Vector3
+	if abs(axis.dot(Vector3.RIGHT)) < 0.9:
+		perp1 = axis.cross(Vector3.RIGHT).normalized()
+	else:
+		perp1 = axis.cross(Vector3.FORWARD).normalized()
+	var perp2: Vector3 = axis.cross(perp1).normalized()
+	var step: float = TAU / float(segments)
+	var prev: Vector3 = center + perp1 * radius
+	for i in segments:
+		var angle: float = step * float(i + 1)
+		var next: Vector3 = center + (perp1 * cos(angle) + perp2 * sin(angle)) * radius
+		_editor_im.surface_set_color(color)
+		_editor_im.surface_add_vertex(prev)
+		_editor_im.surface_set_color(color)
+		_editor_im.surface_add_vertex(next)
+		prev = next
+
+
+func _exit_tree() -> void:
+	if _rd:
+		_rd.free_rid(_positions_buffer)
+		_rd.free_rid(_predicted_buffer)
+		_rd.free_rid(_velocities_buffer)
+		_rd.free_rid(_constraints_buffer)
+		_rd.free_rid(_colliders_buffer)
+		_rd.free_rid(_predict_pipeline)
+		_rd.free_rid(_solve_pipeline)
+		_rd.free_rid(_update_pipeline)
+		_rd.free_rid(_collide_pipeline)
+		_rd.free_rid(_predict_shader)
+		_rd.free_rid(_solve_shader)
+		_rd.free_rid(_update_shader)
+		_rd.free_rid(_collide_shader)
+		_rd.free()
