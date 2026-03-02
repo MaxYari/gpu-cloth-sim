@@ -4,7 +4,7 @@ GPU-accelerated cloth simulation for Godot 4.5+ using Position-Based Dynamics on
 
 # Demo
 
-https://github.com/alien-life/gpu-cloth-sim/raw/main/demo/UpdatedCloth.mp4
+![Demo](demo/UpdatedCloth.gif)
 
 ## Features
 
