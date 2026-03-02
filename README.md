@@ -2,9 +2,13 @@
 
 GPU-accelerated cloth simulation for Godot 4.5+ using Position-Based Dynamics on compute shaders.
 
-# Demo
+## Demo
 
 ![Demo](demo/UpdatedCloth.gif)
+
+
+## Support
+Join the discord for support :) -- https://discord.gg/maFsFAfqnY
 
 ## Features
 
