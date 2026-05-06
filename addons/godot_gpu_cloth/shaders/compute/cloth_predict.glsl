@@ -3,9 +3,10 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) restrict buffer Positions  { vec4 positions[];  };
-layout(set = 0, binding = 1, std430) restrict buffer Predicted   { vec4 predicted[];  };
-layout(set = 0, binding = 2, std430) restrict buffer Velocities  { vec4 velocities[]; };
+layout(set = 0, binding = 0, std430) restrict buffer    Positions      { vec4 positions[];      };
+layout(set = 0, binding = 1, std430) restrict buffer    Predicted      { vec4 predicted[];      };
+layout(set = 0, binding = 2, std430) restrict buffer    Velocities     { vec4 velocities[];     };
+layout(set = 0, binding = 5, std430) restrict readonly buffer SkinnedTargets { vec4 skinned_targets[]; };
 
 layout(push_constant, std430) uniform Params {
     float dt;
@@ -26,28 +27,33 @@ void main() {
     if (idx >= particle_count) return;
 
     float w = positions[idx].w;
+
+    // Anchored particle (inverse_mass == 0): track the skeleton-driven position
+    // from the skin compute pass. Zero velocity so constraints don't pull it.
     if (w < 0.001) {
-        predicted[idx] = positions[idx];
+        vec3 target = skinned_targets[idx].xyz;
+        positions[idx]  = vec4(target, 0.0);
+        predicted[idx]  = vec4(target, 0.0);
         velocities[idx] = vec4(0.0);
         return;
     }
+
     vec3 pos = positions[idx].xyz;
 
-    // Reference frame correction — compensate for parent movement so free particles have inertia
+    // Reference-frame correction: compensate for parent node movement so free
+    // particles feel inertia rather than teleporting with the solver node.
     pos -= vec3(inertia_x, inertia_y, inertia_z);
 
     vec3 vel = velocities[idx].xyz;
 
-    // Semi-implicit Euler — step() zeros gravity for pinned particles (w == 0)
-    vel += vec3(0.0, gravity, 0.0) * dt * step(0.001, w);
-    vel += vec3(wind_x, wind_y, wind_z) * dt * step(0.001, w);
+    vel += vec3(0.0, gravity, 0.0) * dt;
+    vel += vec3(wind_x, wind_y, wind_z) * dt;
 
-    // Clamp velocity to prevent runaway
     float speed = length(vel);
     if (speed > max_speed) vel *= max_speed / speed;
 
     vec3 p = pos + vel * dt;
 
-    predicted[idx] = vec4(p, w);
+    predicted[idx]  = vec4(p, w);
     velocities[idx] = vec4(vel, 0.0);
 }

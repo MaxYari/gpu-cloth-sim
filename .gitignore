@@ -3,3 +3,5 @@
 *.import
 .DS_Store
 Thumbs.db
+.claude
+transcript.txt

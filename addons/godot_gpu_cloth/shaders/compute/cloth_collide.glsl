@@ -4,7 +4,8 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 1, std430) restrict buffer Predicted  { vec4 predicted[];  };
-layout(set = 0, binding = 4, std430) restrict readonly buffer Colliders { vec4 colliders[]; };
+layout(set = 0, binding = 4, std430) restrict readonly buffer Colliders      { vec4 colliders[];       };
+layout(set = 0, binding = 5, std430) restrict readonly buffer SkinnedTargets { vec4 skinned_targets[]; };
 
 layout(push_constant, std430) uniform Params {
     float dt;
@@ -26,37 +27,58 @@ void main() {
     float w = predicted[idx].w;
     if (w < 0.001) return;
 
-    vec3 pos = predicted[idx].xyz;
+    vec3 pos      = predicted[idx].xyz;
+    vec3 skin_pos = skinned_targets[idx].xyz;
 
     for (uint c = 0; c < collider_count; c++) {
         float shape_type = colliders[c * 4 + 1].w;
 
         if (shape_type < 0.5) {
             // Capsule / Sphere
-            vec3 a = colliders[c * 4].xyz;
-            vec3 b = colliders[c * 4 + 1].xyz;
-            float r = colliders[c * 4].w;
-
-            vec3 ab = b - a;
+            vec3  a   = colliders[c * 4].xyz;
+            vec3  b   = colliders[c * 4 + 1].xyz;
+            float r   = colliders[c * 4].w;
+            vec3  ab  = b - a;
             float ab2 = dot(ab, ab);
-            float t = (ab2 > 1e-12) ? clamp(dot(pos - a, ab) / ab2, 0.0, 1.0) : 0.0;
-            vec3 closest = a + ab * t;
 
-            vec3 diff = pos - closest;
-            float dist = length(diff);
+            float t_sk       = (ab2 > 1e-12) ? clamp(dot(skin_pos - a, ab) / ab2, 0.0, 1.0) : 0.0;
+            vec3  closest_sk = a + ab * t_sk;
+            vec3  skin_diff  = skin_pos - closest_sk;
+            float skin_dist  = length(skin_diff);
 
+            // Step 1 - hemisphere plane: ALWAYS run, regardless of whether pos
+            // is inside or outside the collider.  The plane sits at r*0.5 from
+            // the axis (halfway inside the surface) so it never crosses the
+            // symmetry axis even when skin_pos clips slightly inside at a joint.
+            // This establishes the correct side BEFORE the surface push, which
+            // would otherwise blindly push toward the nearest surface.
+            if (skin_dist > 1e-7) {
+                vec3  skin_normal = skin_diff / skin_dist;
+                float proj        = dot(pos - closest_sk, skin_normal);
+                if (proj < r * 0.5) {
+                    pos += skin_normal * (r * 0.5 - proj);
+                }
+            }
+
+            // Step 2 - surface push: pos is now on the correct hemisphere.
+            // Push it outside the collider surface if it is still inside.
+            float t       = (ab2 > 1e-12) ? clamp(dot(pos - a, ab) / ab2, 0.0, 1.0) : 0.0;
+            vec3  closest = a + ab * t;
+            vec3  diff    = pos - closest;
+            float dist    = length(diff);
             if (dist < r && dist > 1e-7) {
                 pos = closest + (diff / dist) * r;
             }
+
         } else {
             // Box (OBB)
-            vec3 center = colliders[c * 4].xyz;
+            vec3 center   = colliders[c * 4].xyz;
             vec3 half_ext = colliders[c * 4 + 1].xyz;
-            vec3 right = colliders[c * 4 + 2].xyz;
-            vec3 up_dir = colliders[c * 4 + 3].xyz;
-            vec3 fwd = cross(right, up_dir);
+            vec3 right    = colliders[c * 4 + 2].xyz;
+            vec3 up_dir   = colliders[c * 4 + 3].xyz;
+            vec3 fwd      = cross(right, up_dir);
 
-            vec3 d = pos - center;
+            vec3 d         = pos - center;
             vec3 local_pos = vec3(dot(d, right), dot(d, up_dir), dot(d, fwd));
 
             if (all(lessThan(abs(local_pos), half_ext))) {
