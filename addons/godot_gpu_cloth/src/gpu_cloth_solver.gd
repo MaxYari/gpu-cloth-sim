@@ -618,7 +618,7 @@ func _simulate(delta: float) -> void:
 	_pbd_push.encode_float(48, local_wind.x)
 	_pbd_push.encode_float(52, local_wind.y)
 	_pbd_push.encode_float(56, local_wind.z)
-	_pbd_push.encode_float(60, 0.0)
+	_pbd_push.encode_float(60, 1.0 / float(substeps))
 
 	var groups := ceili(float(_particle_count) / 64.0)
 

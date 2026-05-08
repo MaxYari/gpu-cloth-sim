@@ -19,7 +19,8 @@ layout(push_constant, std430) uniform Params {
     float max_speed;
     float pad1, pad2;
     float pad3, pad4, pad5, max_travel;
-    float pad7, pad8, pad9, pad10;
+    float pad7, pad8, pad9;
+    float inv_substeps;
 };
 
 void main() {
@@ -57,9 +58,9 @@ void main() {
     // cloth_weight == 1.0  -> fully simulated (no lerp)
     // cloth_weight in (0,1) -> partial skeleton influence
     if (cloth_w < 0.999) {
-        new_pos = mix(skinned_targets[idx].xyz, new_pos, cloth_w);
-        // Damp velocity for blend particles so the seam doesn't oscillate.
-        vel *= cloth_w;
+        float sub_w = pow(cloth_w, inv_substeps);
+        new_pos = mix(skinned_targets[idx].xyz, new_pos, sub_w);
+        vel *= sub_w;
     }
 
     positions[idx]  = vec4(new_pos, w);
