@@ -2,7 +2,11 @@
 
 GPU-accelerated cloth simulation for Godot 4.5+ using Position-Based Dynamics on compute shaders.
 
-## Demo
+## In this fork
+
+Vertex painted kkinned mesh support based on [Blowing from the West](https://www.youtube.com/watch?v=d61_o4CGQd8) GDC talk.
+
+## Old Demo
 
 ![Demo](demo/UpdatedCloth.gif)
 
