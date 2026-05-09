@@ -365,8 +365,9 @@ func _initialize() -> void:
 		push_error("[GPUCloth] Surface %d must use a ShaderMaterial with cloth_surface.gdshader. Aborting." % surface_index)
 		return
 	_surf_mat = mat as ShaderMaterial
-	_surf_mat.set_shader_parameter("tex_width",             _tex_w)
+	_surf_mat.set_shader_parameter("tex_width",              _tex_w)
 	_surf_mat.set_shader_parameter("skel_to_mesh_transform", mesh_to_skel.affine_inverse())
+	_surf_mat.set_shader_parameter("gpu_driven",             true)
 	# positions_tex / normals_tex RIDs are wired up inside _gpu_do_init on the render thread.
 	_surf_mat.set_shader_parameter("positions_tex", _positions_tex)
 	_surf_mat.set_shader_parameter("normals_tex",   _normals_tex)
