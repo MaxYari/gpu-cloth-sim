@@ -411,15 +411,26 @@ func _build_output_mesh(vert_arr: PackedVector3Array, mesh_to_skel: Transform3D)
 	_output_mesh_instance.extra_cull_margin = 10.0
 
 	# Material: must use cloth_surface.gdshader for the vertex stage.
+	var shader: Shader = load(_plugin_dir + "/shaders/cloth_surface.gdshader")
 	if cloth_material is ShaderMaterial:
 		_cloth_mat = cloth_material as ShaderMaterial
 	else:
 		if cloth_material:
 			push_warning("[GPUCloth] cloth_material must be a ShaderMaterial using " +
 				"cloth_surface.gdshader. Creating a default one.")
-		var shader: Shader = load(_plugin_dir + "/shaders/cloth_surface.gdshader")
 		_cloth_mat = ShaderMaterial.new()
 		_cloth_mat.shader = shader
+		# Auto-copy visual properties from the original mesh surface material so the
+		# cloth looks identical to the source mesh without requiring manual setup.
+		var src := _mesh_instance_node.get_active_material(surface_index)
+		if src is StandardMaterial3D:
+			var s := src as StandardMaterial3D
+			_cloth_mat.set_shader_parameter("albedo_texture", s.albedo_texture)
+			_cloth_mat.set_shader_parameter("color_tint",     s.albedo_color)
+			_cloth_mat.set_shader_parameter("roughness",      s.roughness)
+			_cloth_mat.set_shader_parameter("metallic",       s.metallic)
+			_cloth_mat.set_shader_parameter("specular",       s.metallic_specular)
+			print("[GPUCloth] Auto-copied material properties from StandardMaterial3D.")
 
 	_output_mesh_instance.material_override = _cloth_mat
 	_cloth_mat.set_shader_parameter("tex_width", _tex_w)
