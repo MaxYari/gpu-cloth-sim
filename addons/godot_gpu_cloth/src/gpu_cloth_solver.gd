@@ -7,11 +7,15 @@ extends Node3D
 # ---------------------------------------------------------------------------
 @export_group("Mesh Input")
 ## MeshInstance3D whose mesh and skeleton will drive the simulation.
-@export var target_mesh: NodePath
+## Its surface material MUST be a ShaderMaterial using cloth_surface.gdshader.
+@export var target_mesh: NodePath:
+	set(v): target_mesh = v; update_configuration_warnings()
 ## Skeleton3D that animates the mesh.
-@export var skeleton: NodePath
+@export var skeleton: NodePath:
+	set(v): skeleton = v; update_configuration_warnings()
 ## Which surface index on the ArrayMesh to simulate (0-based).
-@export var surface_index: int = 0
+@export var surface_index: int = 0:
+	set(v): surface_index = v; update_configuration_warnings()
 
 @export_group("Physics")
 @export var gravity_strength: float = -9.8
@@ -23,9 +27,6 @@ extends Node3D
 @export var max_travel_distance: float = 0.1
 
 @export_group("Appearance")
-## Must be a ShaderMaterial using cloth_surface.gdshader.
-## If left empty a default ShaderMaterial is created automatically.
-@export var cloth_material: Material
 ## Flip computed normals.
 @export var flip_normals: bool = false
 
@@ -122,9 +123,7 @@ var _collider_count: int = 0
 var _uvs: PackedVector2Array
 var _indices: PackedInt32Array
 
-var _output_mesh: ArrayMesh
-var _output_mesh_instance: MeshInstance3D
-var _cloth_mat: ShaderMaterial   # always our ShaderMaterial
+var _surf_mat: ShaderMaterial   # the ShaderMaterial on the simulated surface
 
 var _prev_mesh_world_pos: Vector3
 
@@ -199,6 +198,29 @@ func _exit_tree() -> void:
 				rd.free_rid(rid)
 	)
 	print("[GPUCloth] GPU resource cleanup queued on render thread.")
+
+
+# ---------------------------------------------------------------------------
+#  Editor warnings
+# ---------------------------------------------------------------------------
+
+func _get_configuration_warnings() -> PackedStringArray:
+	var w := PackedStringArray()
+	var mi := get_node_or_null(target_mesh) as MeshInstance3D
+	if not mi:
+		w.append("target_mesh must point to a MeshInstance3D.")
+		return w
+	if not get_node_or_null(skeleton) is Skeleton3D:
+		w.append("skeleton must point to a Skeleton3D.")
+	var mat := mi.get_active_material(surface_index)
+	if not mat is ShaderMaterial:
+		w.append("Surface %d of target_mesh must use a ShaderMaterial. " % surface_index +
+			"Assign a ShaderMaterial using cloth_surface.gdshader to that surface.")
+	elif not (mat as ShaderMaterial).shader or \
+			not (mat as ShaderMaterial).shader.resource_path.ends_with("cloth_surface.gdshader"):
+		w.append("Surface %d's ShaderMaterial must use cloth_surface.gdshader " % surface_index +
+			"so the solver can drive vertex positions and normals from the GPU.")
+	return w
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +359,20 @@ func _initialize() -> void:
 	_positions_tex = Texture2DRD.new()
 	_normals_tex   = Texture2DRD.new()
 
-	# ── Output mesh (built once from rest-pose, vertex shader overrides VERTEX/NORMAL)
-	_build_output_mesh(vert_arr, mesh_to_skel)
+	# ── Grab the ShaderMaterial from the existing mesh surface ────────────────
+	var mat := _mesh_instance_node.get_active_material(surface_index)
+	if not mat is ShaderMaterial:
+		push_error("[GPUCloth] Surface %d must use a ShaderMaterial with cloth_surface.gdshader. Aborting." % surface_index)
+		return
+	_surf_mat = mat as ShaderMaterial
+	_surf_mat.set_shader_parameter("tex_width",             _tex_w)
+	_surf_mat.set_shader_parameter("skel_to_mesh_transform", mesh_to_skel.affine_inverse())
+	# positions_tex / normals_tex RIDs are wired up inside _gpu_do_init on the render thread.
+	_surf_mat.set_shader_parameter("positions_tex", _positions_tex)
+	_surf_mat.set_shader_parameter("normals_tex",   _normals_tex)
+
+	# Prevent the mesh from being frustum-culled when cloth moves far from rest pose.
+	_mesh_instance_node.extra_cull_margin = 10.0
 
 	# ── Push constant buffers ────────────────────────────────────────────────
 	_skin_push = PackedByteArray(); _skin_push.resize(64)
@@ -376,78 +410,6 @@ func _initialize() -> void:
 
 	_prev_mesh_world_pos = _skeleton_node.global_position
 	print("[GPUCloth] ── CPU initialization complete ───────────────────────────")
-
-
-# ---------------------------------------------------------------------------
-#  Build static output mesh  (called once; vertex shader overrides geometry)
-# ---------------------------------------------------------------------------
-
-func _build_output_mesh(vert_arr: PackedVector3Array, mesh_to_skel: Transform3D) -> void:
-	_output_mesh          = ArrayMesh.new()
-	_output_mesh_instance = MeshInstance3D.new()
-	_output_mesh_instance.mesh = _output_mesh
-	_output_mesh_instance.name = "GPUClothOutput"
-
-	# Convert rest positions to skel-local space (solver space).
-	var verts := PackedVector3Array(); verts.resize(_particle_count)
-	for i in _particle_count:
-		verts[i] = mesh_to_skel * vert_arr[i]
-
-	# Dummy normals — vertex shader overrides these every frame.
-	var dummy_normals := PackedVector3Array(); dummy_normals.resize(_particle_count)
-	dummy_normals.fill(Vector3.UP)
-
-	var arrays: Array = []; arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_NORMAL] = dummy_normals
-	arrays[Mesh.ARRAY_INDEX]  = _indices
-	if not _uvs.is_empty():
-		arrays[Mesh.ARRAY_TEX_UV] = _uvs
-
-	_output_mesh.clear_surfaces()
-	_output_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-
-	# Generous cull margin so cloth is never incorrectly frustum-culled.
-	_output_mesh_instance.extra_cull_margin = 10.0
-
-	# Material: must use cloth_surface.gdshader for the vertex stage.
-	var shader: Shader = load(_plugin_dir + "/shaders/cloth_surface.gdshader")
-	if cloth_material is ShaderMaterial:
-		_cloth_mat = cloth_material as ShaderMaterial
-	else:
-		if cloth_material:
-			push_warning("[GPUCloth] cloth_material must be a ShaderMaterial using " +
-				"cloth_surface.gdshader. Creating a default one.")
-		_cloth_mat = ShaderMaterial.new()
-		_cloth_mat.shader = shader
-		# Auto-copy visual properties from the original mesh surface material so the
-		# cloth looks identical to the source mesh without requiring manual setup.
-		var src := _mesh_instance_node.get_active_material(surface_index)
-		if src is StandardMaterial3D:
-			var s := src as StandardMaterial3D
-			_cloth_mat.set_shader_parameter("albedo_texture", s.albedo_texture)
-			_cloth_mat.set_shader_parameter("color_tint",     s.albedo_color)
-			_cloth_mat.set_shader_parameter("roughness",      s.roughness)
-			_cloth_mat.set_shader_parameter("metallic",       s.metallic)
-			_cloth_mat.set_shader_parameter("specular",       s.metallic_specular)
-			print("[GPUCloth] Auto-copied material properties from StandardMaterial3D.")
-
-	_output_mesh_instance.material_override = _cloth_mat
-	_cloth_mat.set_shader_parameter("tex_width", _tex_w)
-	# positions_tex / normals_tex are set after the render thread creates the image RIDs.
-	_cloth_mat.set_shader_parameter("positions_tex", _positions_tex)
-	_cloth_mat.set_shader_parameter("normals_tex",   _normals_tex)
-
-	_skeleton_node.add_child(_output_mesh_instance)
-	_output_mesh_instance.transform = Transform3D.IDENTITY
-	print("[GPUCloth] Output mesh added as child of '%s'." % _skeleton_node.name)
-
-	# Hide the simulated surface on the original mesh.
-	var invisible_mat := StandardMaterial3D.new()
-	invisible_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	invisible_mat.albedo_color  = Color(0, 0, 0, 0)
-	invisible_mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
-	_mesh_instance_node.set_surface_override_material(surface_index, invisible_mat)
 
 
 # ---------------------------------------------------------------------------
