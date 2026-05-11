@@ -3,9 +3,16 @@ extends EditorNode3DGizmoPlugin
 
 const SEGMENTS := 24
 
+const _DITHER_SHADER := preload("collider_gizmo_dither.gdshader")
+
+var _surface_mat: ShaderMaterial
+
 
 func _init() -> void:
 	create_material("main", Color(0.0, 0.85, 1.0))
+	_surface_mat = ShaderMaterial.new()
+	_surface_mat.shader = _DITHER_SHADER
+	_surface_mat.set_shader_parameter("albedo", Color(0.0, 0.85, 1.0, 0.15))
 
 
 func _get_gizmo_name() -> String:
@@ -24,12 +31,18 @@ func _redraw(gizmo: EditorNode3DGizmo) -> void:
 
 	var mat := get_material("main", gizmo)
 	var lines := PackedVector3Array()
+	var surface_mesh: PrimitiveMesh
 
 	match node.shape:
 		GPUClothCollider.Shape.SPHERE:
 			_add_circle(lines, Vector3.ZERO, node.radius, Vector3.UP)
 			_add_circle(lines, Vector3.ZERO, node.radius, Vector3.RIGHT)
 			_add_circle(lines, Vector3.ZERO, node.radius, Vector3.FORWARD)
+			var sm := SphereMesh.new()
+			sm.radius = node.radius
+			sm.height = node.radius * 2.0
+			sm.material = _surface_mat
+			surface_mesh = sm
 
 		GPUClothCollider.Shape.CAPSULE:
 			var half_inner := maxf((node.height * 0.5) - node.radius, 0.0)
@@ -46,11 +59,23 @@ func _redraw(gizmo: EditorNode3DGizmo) -> void:
 			_add_semicircle(lines, top, node.radius, Vector3.FORWARD, true)
 			_add_semicircle(lines, bot, node.radius, Vector3.RIGHT,   false)
 			_add_semicircle(lines, bot, node.radius, Vector3.FORWARD, false)
+			var cm := CapsuleMesh.new()
+			cm.radius = node.radius
+			cm.height = node.height
+			cm.material = _surface_mat
+			surface_mesh = cm
 
 		GPUClothCollider.Shape.BOX:
 			_add_box(lines, node.extents)
+			var bm := BoxMesh.new()
+			bm.size = node.extents * 2.0
+			bm.material = _surface_mat
+			surface_mesh = bm
 
 	gizmo.add_lines(lines, mat)
+	if surface_mesh:
+		surface_mesh.flip_faces = not node.flip_normals
+		gizmo.add_mesh(surface_mesh)
 
 
 func _add_circle(lines: PackedVector3Array, center: Vector3, r: float, normal: Vector3) -> void:

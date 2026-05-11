@@ -6,14 +6,6 @@ extends Node3D
 #  Exports
 # ---------------------------------------------------------------------------
 @export_group("Mesh Input")
-## MeshInstance3D whose mesh and skeleton will drive the simulation.
-## Its surface material MUST be a ShaderMaterial using cloth_surface.gdshader.
-@export var target_mesh: NodePath:
-	set(v): target_mesh = v; update_configuration_warnings()
-## Skeleton3D that animates the mesh.
-@export var skeleton: NodePath:
-	set(v): skeleton = v; update_configuration_warnings()
-## Which surface index on the ArrayMesh to simulate (0-based).
 @export var surface_index: int = 0:
 	set(v): surface_index = v; update_configuration_warnings()
 
@@ -157,7 +149,10 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
-	if Engine.is_editor_hint() or not _gpu_init_done:
+	if Engine.is_editor_hint():
+		update_configuration_warnings()
+		return
+	if not _gpu_init_done:
 		return
 	if _needs_warm_start:
 		RenderingServer.call_on_render_thread(_gpu_do_warm_start)
@@ -206,15 +201,15 @@ func _exit_tree() -> void:
 
 func _get_configuration_warnings() -> PackedStringArray:
 	var w := PackedStringArray()
-	var mi := get_node_or_null(target_mesh) as MeshInstance3D
+	var mi := get_parent() as MeshInstance3D
 	if not mi:
-		w.append("target_mesh must point to a MeshInstance3D.")
+		w.append("GPUClothSolver must be a direct child of a MeshInstance3D.")
 		return w
-	if not get_node_or_null(skeleton) is Skeleton3D:
-		w.append("skeleton must point to a Skeleton3D.")
+	if not mi.get_node_or_null(mi.skeleton) is Skeleton3D:
+		w.append("Parent MeshInstance3D has no valid Skeleton3D assigned.")
 	var mat := mi.get_active_material(surface_index)
 	if not mat is ShaderMaterial:
-		w.append("Surface %d of target_mesh must use a ShaderMaterial. " % surface_index +
+		w.append("Surface %d of the parent mesh must use a ShaderMaterial. " % surface_index +
 			"Assign a ShaderMaterial using cloth_surface.gdshader to that surface.")
 	elif not (mat as ShaderMaterial).shader or \
 			not (mat as ShaderMaterial).shader.resource_path.ends_with("cloth_surface.gdshader"):
@@ -223,20 +218,39 @@ func _get_configuration_warnings() -> PackedStringArray:
 	return w
 
 
+func _validate_property(property: Dictionary) -> void:
+	if property.name != "surface_index":
+		return
+	var mi := get_parent() as MeshInstance3D
+	if not mi:
+		return
+	var arr_mesh := mi.mesh as ArrayMesh
+	if not arr_mesh or arr_mesh.get_surface_count() == 0:
+		return
+	var parts := PackedStringArray()
+	for i in arr_mesh.get_surface_count():
+		var label := arr_mesh.surface_get_name(i)
+		if label.is_empty():
+			label = "Surface %d" % i
+		parts.append("%s:%d" % [label, i])
+	property.hint = PROPERTY_HINT_ENUM
+	property.hint_string = ",".join(parts)
+
+
 # ---------------------------------------------------------------------------
 #  Initialization  (game thread — CPU work only)
 # ---------------------------------------------------------------------------
 
 func _initialize() -> void:
 	# ── Resolve nodes ───────────────────────────────────────────────────────
-	_mesh_instance_node = get_node_or_null(target_mesh) as MeshInstance3D
+	_mesh_instance_node = get_parent() as MeshInstance3D
 	if not _mesh_instance_node:
-		push_error("[GPUCloth] 'target_mesh' is not set or not a MeshInstance3D.")
+		push_error("[GPUCloth] GPUClothSolver must be a direct child of a MeshInstance3D.")
 		return
 
-	_skeleton_node = get_node_or_null(skeleton) as Skeleton3D
+	_skeleton_node = _mesh_instance_node.get_node_or_null(_mesh_instance_node.skeleton) as Skeleton3D
 	if not _skeleton_node:
-		push_error("[GPUCloth] 'skeleton' is not set or not a Skeleton3D.")
+		push_error("[GPUCloth] Parent MeshInstance3D has no valid Skeleton3D assigned.")
 		return
 	print("[GPUCloth] Skeleton: %s  bones: %d" % [_skeleton_node.name, _skeleton_node.get_bone_count()])
 

@@ -12,6 +12,8 @@ enum Shape { SPHERE, CAPSULE, BOX }
 	set(v): height = v; update_gizmos()
 @export var extents: Vector3 = Vector3(0.5, 0.5, 0.5):
 	set(v): extents = v; update_gizmos()
+@export var flip_normals: bool = false:
+	set(v): flip_normals = v; update_gizmos()
 @export var target: NodePath
 
 var _tracked_node: Node3D
