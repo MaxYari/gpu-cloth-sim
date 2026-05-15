@@ -8,6 +8,17 @@ Vertex painted skinned mesh support based on [Blowing from the West](https://www
 
 ![skinned mesh screenshot](demo/skinned_mesh_screenshot.png)
 
+[Watch the demo on YouTube](https://youtu.be/fJwoN_mGC9I)
+
+### Setting up an animated character
+
+1. Vertex-paint your `MeshInstance3D` — white = fully simulated, black = pinned to skeleton
+2. Add a `GPUClothSolver` node as a **child** of you character
+3. On the `GPUClothSolver`, set `surface_index` to the material surface you want simulated — only that surface will be cloth-simulated
+4. Add `GPUClothCollider` to character bones (GPU cloth collides ONLY with those colliders and nothing else)
+
+> The `demo/demo_animated_character.tscn` scene contains a fully configured example — use it as a reference (although it actually might be out of date and im too lazy to check).
+
 ## Old Demo
 
 ![Demo](demo/UpdatedCloth.gif)
